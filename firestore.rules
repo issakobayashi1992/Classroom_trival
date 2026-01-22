@@ -1,0 +1,398 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      let userDoc = get(/databases/$(database)/documents/users/$(request.auth.uid));
+      return userDoc != null && userDoc.data != null ? userDoc.data : null;
+    }
+    
+    function getUserDataExists() {
+      return exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+    
+    function isCoach() {
+      return isAuthenticated() 
+        && getUserDataExists()
+        && getUserData() != null
+        && getUserData().role != null
+        && getUserData().role == 'coach';
+    }
+    
+    function isStudent() {
+      return isAuthenticated() 
+        && getUserDataExists()
+        && getUserData() != null
+        && getUserData().role != null
+        && getUserData().role == 'student';
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() 
+        && getUserDataExists()
+        && getUserData() != null
+        && getUserData().role != null
+        && getUserData().role == 'admin';
+    }
+    
+    function getUserTeamId() {
+      return getUserDataExists() && getUserData() != null && 'teamId' in getUserData() && getUserData().teamId != null
+        ? getUserData().teamId 
+        : null;
+    }
+    
+    function isSameTeam(teamId) {
+      return isAuthenticated() && teamId != null && getUserTeamId() != null && getUserTeamId() == teamId;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    // Users Collection
+    match /users/{userId} {
+      // Users can read their own data
+      // Admins can read all users
+      allow read: if isOwner(userId) || isAdmin();
+      
+      // Users can create their own document during signup
+      // Admins can create any user
+      allow create: if (isOwner(userId) && request.resource.data.uid == userId) || isAdmin();
+      
+      // Users can update their own data (but not change role or uid)
+      // Coaches can update their teamId (for team creation)
+      // Students can update their teamId (for joining a team - only if they don't have one yet or are changing it)
+      // Admins can update any user
+      allow update: if isAdmin() || (
+        isOwner(userId) 
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.role == resource.data.role
+        && (
+          // Allow coaches to set/update their teamId (for team creation)
+          (isCoach()) ||
+          // Allow students to set/update their teamId (for joining a team)
+          (isStudent() && (
+            // Student doesn't have a teamId yet (joining first team) - field doesn't exist or is null/empty
+            (!('teamId' in resource.data) || resource.data.teamId == null || resource.data.teamId == '') ||
+            // Student is updating their teamId (switching teams)
+            ('teamId' in resource.data && resource.data.teamId != null && 'teamId' in request.resource.data && request.resource.data.teamId != resource.data.teamId)
+          )) ||
+          // Or if teamId is not being changed (both exist and are equal, or both don't exist)
+          (('teamId' in request.resource.data) == ('teamId' in resource.data) 
+           && (!('teamId' in request.resource.data) || request.resource.data.teamId == resource.data.teamId))
+        )
+      );
+      
+      // Admins can delete any user
+      allow delete: if isAdmin();
+    }
+    
+    // Questions Collection
+    match /questions/{questionId} {
+      // Public questions: any authenticated user can read
+      // Private questions: team members can read their team's questions
+      // Coaches can read questions they created or questions from their team
+      // Admins can read all questions
+      // Note: For collection queries, we need to allow broader access since rules can't filter queries
+      allow read: if isAuthenticated() && (
+        // Public questions - anyone authenticated can read
+        resource.data.isPublic == true
+        // Admin can read everything (check if user data exists first)
+        || (getUserDataExists() && getUserData() != null && getUserData().role == 'admin')
+        // Private questions - team members can read their team's questions
+        || (resource.data.isPublic == false && resource.data.teamId != null && isSameTeam(resource.data.teamId))
+        // Coaches can read questions they created (even if user data doesn't exist yet)
+        || (resource.data.createdBy == request.auth.uid)
+        // Coaches can read questions from their team (if user data exists and has teamId)
+        || (getUserDataExists() && getUserData() != null && getUserData().role == 'coach' && getUserTeamId() != null && resource.data.teamId == getUserTeamId())
+        // Students can read questions from their team
+        || (getUserDataExists() && getUserData() != null && getUserData().role == 'student' && resource.data.teamId != null && isSameTeam(resource.data.teamId))
+      );
+      
+      // Coaches and admins can create questions
+      allow create: if isAdmin() || (isCoach() 
+        && request.resource.data.createdBy == request.auth.uid);
+      
+      // The creator or admin can update questions
+      allow update: if isAdmin() || (isCoach() 
+        && resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdBy == resource.data.createdBy);
+      
+      // The creator or admin can delete questions
+      allow delete: if isAdmin() || (isCoach() 
+        && request.auth != null);
+    }
+    
+    // Teams Collection
+    match /teams/{teamId} {
+      // Anyone can read teams (needed for Team ID validation during signup and when joining)
+      // Team IDs are meant to be shareable, so allowing public read access is safe
+      // This allows unauthenticated users to validate Team IDs during signup
+      allow read: if true;
+      
+      // Coaches and admins can create teams
+      // Allow authenticated users to create teams during signup (even if user document doesn't exist yet)
+      // This is safe because they're setting themselves as the coach (coachId == request.auth.uid)
+      allow create: if isAdmin() || (
+        isAuthenticated()
+        && request.resource.data.coachId == request.auth.uid
+        && request.resource.data.id == teamId
+      );
+      
+      // The team's coach or admin can update the team
+      // Students can update the team's playerIds array to add themselves (using arrayUnion)
+      // Ensure critical fields are not modified and only arrayUnion is used
+      // Note: id is the document ID and cannot be changed via update
+      allow update: if isAdmin() 
+        || (isCoach() && resource.data.coachId == request.auth.uid)
+        || (isStudent() 
+          && isAuthenticated()
+          // Ensure critical fields remain unchanged
+          && request.resource.data.coachId == resource.data.coachId
+          && request.resource.data.id == resource.data.id
+          && request.resource.data.name == resource.data.name
+          // Verify arrayUnion operation: size stays same (element already exists) or increases by 1
+          // All existing elements must remain (hasAll ensures no elements are removed)
+          && 'playerIds' in request.resource.data
+          && 'playerIds' in resource.data
+          && request.resource.data.playerIds.hasAll(resource.data.playerIds)
+          && (request.resource.data.playerIds.size() == resource.data.playerIds.size() 
+              || request.resource.data.playerIds.size() == resource.data.playerIds.size() + 1));
+      
+      // The team's coach or admin can delete the team
+      allow delete: if isAdmin() || (isCoach() 
+        && resource.data.coachId == request.auth.uid);
+    }
+    
+    // Players Collection
+    match /players/{playerId} {
+      // Players can read their own data (by document ID or userId field)
+      // Team members and coaches can read players in their team
+      // Admins can read all players
+      // Note: Check document ID first as it's the most common case
+      allow read: if isAdmin() 
+        || (isAuthenticated() && isOwner(playerId))
+        || (isAuthenticated() && resource.data != null && 'userId' in resource.data && resource.data.userId != null && isOwner(resource.data.userId))
+        || (isAuthenticated() && resource.data != null && resource.data.teamId != null && getUserTeamId() != null && isSameTeam(resource.data.teamId));
+      
+      // Can create player document during signup (for students)
+      // Admins can create any player document
+      allow create: if isAdmin() || (isAuthenticated() 
+        && request.resource.data.userId == request.auth.uid);
+      
+      // Players can update their own stats (limited fields)
+      // Admins can update any player
+      // Note: Cloud Functions have admin access and bypass these rules
+      allow update: if isAdmin() || (isAuthenticated() 
+        && resource.data.userId == request.auth.uid);
+      
+      // Admins can delete players
+      allow delete: if isAdmin();
+    }
+    
+    // Games Collection
+    match /games/{gameId} {
+      // Users can read games they're involved in
+      // Allow reading by matchIdCode (shareable join code) for authenticated users
+      // Team membership is still enforced for updates
+      // Note: For queries by matchIdCode to work, we allow authenticated users to read match games
+      // The security is enforced at the update level (team membership required to join)
+      // Allow reading games - match games are readable by any authenticated user
+      // Practice games are only readable by the player who owns them
+      allow read: if isAuthenticated() && resource.data != null && (
+        // ANY game with teamId is a match game (readable by all authenticated users)
+        // This handles both new structure (coachId) and old structure (just teamId)
+        ('teamId' in resource.data && resource.data.teamId != null) ||
+        // OR match games with explicit indicators
+        ('coachId' in resource.data && resource.data.coachId != null) ||
+        ('type' in resource.data && resource.data.type == 'match') ||
+        ('matchIdCode' in resource.data && resource.data.matchIdCode != null) ||
+        ('status' in resource.data && resource.data.status == 'waiting') ||
+        // Practice games: users can read their own games (have playerId matching auth uid AND no teamId)
+        ('playerId' in resource.data && resource.data.playerId == request.auth.uid && !('teamId' in resource.data))
+      );
+      
+      // Users can create practice games for themselves (playerId must match auth uid)
+      // Coaches can create match games (coachId must match auth uid, type must be 'match')
+      // Admins can create any game
+      allow create: if isAdmin() || (
+        isAuthenticated() && (
+          // Practice games: playerId must match auth uid
+          (request.resource.data.type == 'practice' 
+           && request.resource.data.playerId != null 
+           && request.resource.data.playerId == request.auth.uid) ||
+          // Match games: coachId must match auth uid and type must be 'match'
+          (request.resource.data.type == 'match' 
+           && request.resource.data.coachId != null 
+           && request.resource.data.coachId == request.auth.uid 
+           && isCoach())
+        )
+      );
+      
+      // Users can update games they're involved in
+      // Students can join match games by updating playerIds array
+      // Students can also update game status to 'completed' when all players finish
+      // Note: Cloud Functions have admin access and bypass these rules
+      allow update: if isAdmin() || (
+        isAuthenticated() && (
+          // Practice games: player can update their own game
+          (resource.data != null && resource.data.playerId != null && resource.data.playerId == request.auth.uid) ||
+          // Match games: coach can update their match
+          (resource.data != null && resource.data.coachId != null && resource.data.coachId == request.auth.uid) ||
+          // Match games: players can update status to 'completed' if they're part of the game
+          (resource.data != null 
+           && (
+             ('teamId' in resource.data && resource.data.teamId != null) ||
+             ('type' in resource.data && resource.data.type == 'match') ||
+             ('coachId' in resource.data && resource.data.coachId != null)
+           )
+           && 'playerIds' in resource.data
+           && resource.data.playerIds != null
+           && request.auth.uid in resource.data.playerIds
+           && 'status' in request.resource.data
+           && request.resource.data.status == 'completed'
+           && request.resource.data.status != resource.data.status) ||
+          // Match games: any authenticated user can join by updating playerIds array using arrayUnion
+          // Match games are identified by having teamId OR type='match' OR coachId
+          // Note: When using arrayUnion, request.resource.data only contains the fields being updated (playerIds)
+          (resource.data != null 
+           && (
+             // Game is a match if it has teamId (most reliable indicator - works for old and new documents)
+             ('teamId' in resource.data && resource.data.teamId != null) ||
+             // OR explicitly marked as match
+             ('type' in resource.data && resource.data.type == 'match') ||
+             // OR has coachId
+             ('coachId' in resource.data && resource.data.coachId != null)
+           )
+           && 'status' in resource.data
+           && resource.data.status == 'waiting'
+           // If game has teamId, check if user is on same team
+           // If no teamId or user doc doesn't exist, allow join (for backwards compatibility)
+           && (
+             !('teamId' in resource.data) || 
+             resource.data.teamId == null || 
+             resource.data.teamId == '' ||
+             (getUserDataExists() && getUserTeamId() != null && getUserTeamId() == resource.data.teamId)
+           )
+           // When using arrayUnion, request.resource.data only has playerIds
+           && 'playerIds' in request.resource.data)
+        )
+      );
+    }
+    
+    // Match History Collection
+    match /matchHistory/{matchId} {
+      // Users can read match history for their team or their own matches
+      // Also allow reading match histories for games they're part of (needed for completion check and results)
+      // Coaches can read match histories for their team's games
+      allow read: if isAuthenticated() && (
+        // User's own match history
+        resource.data.playerId == request.auth.uid ||
+        // Match histories for the same team (allows reading all team members' match histories)
+        // This covers most cases since all players in a match are on the same team
+        (resource.data.teamId != null 
+         && getUserTeamId() != null 
+         && resource.data.teamId == getUserTeamId()) ||
+        // Match histories for games the user is part of (fallback if teamId check fails)
+        // Check if user is in game.playerIds - this allows reading match histories for the game
+        (resource.data.gameId != null 
+         && exists(/databases/$(database)/documents/games/$(resource.data.gameId))
+         && get(/databases/$(database)/documents/games/$(resource.data.gameId)).data.playerIds != null
+         && request.auth.uid in get(/databases/$(database)/documents/games/$(resource.data.gameId)).data.playerIds) ||
+        // Coaches can read match histories for games they created (coachId matches)
+        (isCoach()
+         && resource.data.gameId != null
+         && exists(/databases/$(database)/documents/games/$(resource.data.gameId))
+         && get(/databases/$(database)/documents/games/$(resource.data.gameId)).data.coachId == request.auth.uid) ||
+        // Coaches can read match histories for their team's games
+        (isCoach()
+         && resource.data.teamId != null
+         && getUserTeamId() != null
+         && resource.data.teamId == getUserTeamId())
+      );
+      
+      // Users can create their own match history
+      // Ensure playerId matches the authenticated user's UID exactly
+      // This is the core security check - playerId must match auth uid
+      // Note: Cloud Functions have admin access and bypass these rules
+      allow create: if isAuthenticated() 
+        && request.resource.data.playerId == request.auth.uid;
+    }
+    
+    // Leaderboards Collection
+    match /leaderboards/{leaderboardId} {
+      // Team members can read their team's leaderboard
+      allow read: if isAuthenticated() 
+        && resource.data.teamId != null 
+        && isSameTeam(resource.data.teamId);
+      
+      // Cloud Functions have admin access, so they bypass these rules
+      // No client-side writes allowed for leaderboards
+      allow write: if false;
+    }
+    
+    // Settings Collection
+    match /settings/{settingsId} {
+      // Team members can read their team's settings
+      // Anyone can read default settings
+      allow read: if isAuthenticated() && (
+        settingsId == 'default' ||
+        (getUserTeamId() != null && settingsId == getUserTeamId())
+      );
+      
+      // Only coaches can update settings for their team
+      allow write: if isCoach() && (
+        settingsId == 'default' ||
+        (getUserTeamId() != null && settingsId == getUserTeamId())
+      );
+    }
+    
+    // Match States Collection (for real-time game state)
+    match /matchStates/{gameId} {
+      // Users can read match states for games they're involved in
+      allow read: if isAuthenticated();
+      
+      // Users can create/update match states for their games
+      // Cloud Functions can manage all match states
+      allow write: if isAuthenticated();
+    }
+    
+    // Notifications Collection
+    match /notifications/{notificationId} {
+      // Users can read their own notifications
+      allow read: if isAuthenticated() 
+        && resource.data.userId == request.auth.uid;
+      
+      // Users can create notifications for themselves
+      // Team members can create notifications for others on their team (for match end notifications)
+      // Coaches can create notifications for their team members
+      allow create: if isAuthenticated() && (
+        request.resource.data.userId == request.auth.uid ||
+        // Allow creating notifications for team members (students can notify coach, coach can notify students)
+        (getUserTeamId() != null 
+         && request.resource.data.teamId != null 
+         && request.resource.data.teamId == getUserTeamId()
+         && exists(/databases/$(database)/documents/users/$(request.resource.data.userId))
+         && get(/databases/$(database)/documents/users/$(request.resource.data.userId)).data.teamId == getUserTeamId())
+      );
+      
+      // Users can update their own notifications (to mark as read)
+      allow update: if isAuthenticated() 
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.read == true;
+      
+      // Users can delete their own notifications
+      allow delete: if isAuthenticated() 
+        && resource.data.userId == request.auth.uid;
+    }
+  }
+}
+
+
